@@ -130,25 +130,82 @@ function configureSessionSerialization(getUserById) {
 }
 
 /**
- * Configure Passport OpenID Connect Strategy
+ * Fetch OIDC endpoints from the provider's discovery document.
+ * Falls back to manually specified env vars if present.
+ * Works with any standard OIDC provider (Authentik, Keycloak, Okta, etc.)
+ *
+ * @param {string} issuerUrl - The OIDC issuer URL (e.g. https://auth.example.com/application/o/myapp/)
+ * @returns {Promise<{authorizationURL, tokenURL, userInfoURL}>}
  */
-function configureOidcStrategy(findUserByOidcId, findUserByEmail, createUser) {
+async function discoverOidcEndpoints(issuerUrl) {
+    // Allow manual overrides via env vars (useful for non-standard providers)
+    if (process.env.OIDC_AUTH_URL && process.env.OIDC_TOKEN_URL && process.env.OIDC_USERINFO_URL) {
+        console.log('[OIDC] Using manually specified endpoint URLs from environment variables');
+        return {
+            authorizationURL: process.env.OIDC_AUTH_URL,
+            tokenURL: process.env.OIDC_TOKEN_URL,
+            userInfoURL: process.env.OIDC_USERINFO_URL,
+        };
+    }
+
+    // Build the discovery URL: strip trailing slash, append well-known path
+    const base = issuerUrl.replace(/\/$/, '');
+    const discoveryUrl = `${base}/.well-known/openid-configuration`;
+
+    console.log(`[OIDC] Fetching discovery document from: ${discoveryUrl}`);
+
+    const res = await fetch(discoveryUrl);
+    if (!res.ok) {
+        throw new Error(`[OIDC] Discovery failed: HTTP ${res.status} from ${discoveryUrl}`);
+    }
+
+    const config = await res.json();
+
+    const authorizationURL = config.authorization_endpoint;
+    const tokenURL = config.token_endpoint;
+    const userInfoURL = config.userinfo_endpoint;
+
+    if (!authorizationURL || !tokenURL || !userInfoURL) {
+        throw new Error(
+            `[OIDC] Discovery document from ${discoveryUrl} is missing required endpoints. ` +
+            `Got: authorization_endpoint=${authorizationURL}, token_endpoint=${tokenURL}, userinfo_endpoint=${userInfoURL}`
+        );
+    }
+
+    console.log(`[OIDC] Discovery successful:`);
+    console.log(`  authorization_endpoint: ${authorizationURL}`);
+    console.log(`  token_endpoint:         ${tokenURL}`);
+    console.log(`  userinfo_endpoint:      ${userInfoURL}`);
+
+    return { authorizationURL, tokenURL, userInfoURL };
+}
+
+/**
+ * Configure Passport OpenID Connect Strategy.
+ * Automatically discovers provider endpoints via the OIDC discovery document,
+ * so it works with any standard provider (Authentik, Keycloak, Okta, etc.)
+ * without hardcoding provider-specific URL paths.
+ */
+async function configureOidcStrategy(findUserByOidcId, findUserByEmail, createUser) {
     if (!process.env.OIDC_ISSUER_URL || !process.env.OIDC_CLIENT_ID || !process.env.OIDC_CLIENT_SECRET) {
-        console.warn('OIDC configuration missing - SSO disabled');
+        console.warn('[OIDC] Configuration missing (OIDC_ISSUER_URL / OIDC_CLIENT_ID / OIDC_CLIENT_SECRET) - SSO disabled');
         return;
     }
 
     const { Strategy: OpenIDConnectStrategy } = require('passport-openidconnect');
 
+    // Discover endpoints from the provider's .well-known/openid-configuration
+    const { authorizationURL, tokenURL, userInfoURL } = await discoverOidcEndpoints(process.env.OIDC_ISSUER_URL);
+
     passport.use(new OpenIDConnectStrategy({
-        issuer: process.env.OIDC_ISSUER_URL || 'https://mock-issuer.com', // Dummy default for mock
-        authorizationURL: process.env.OIDC_AUTH_URL || `${process.env.OIDC_ISSUER_URL}/protocol/openid-connect/auth`,
-        tokenURL: process.env.OIDC_TOKEN_URL || `${process.env.OIDC_ISSUER_URL}/protocol/openid-connect/token`,
-        userInfoURL: process.env.OIDC_USERINFO_URL || `${process.env.OIDC_ISSUER_URL}/protocol/openid-connect/userinfo`,
-        clientID: process.env.OIDC_CLIENT_ID || 'mock-client-id',
-        clientSecret: process.env.OIDC_CLIENT_SECRET || 'mock-secret',
+        issuer: process.env.OIDC_ISSUER_URL,
+        authorizationURL,
+        tokenURL,
+        userInfoURL,
+        clientID: process.env.OIDC_CLIENT_ID,
+        clientSecret: process.env.OIDC_CLIENT_SECRET,
         callbackURL: process.env.OIDC_CALLBACK_URL || '/api/auth/oidc/callback',
-        scope: ['openid', 'profile', 'email']
+        scope: (process.env.OIDC_SCOPES || 'openid profile email').split(' ')
     },
         async (...args) => {
             // The done callback is always the last argument
