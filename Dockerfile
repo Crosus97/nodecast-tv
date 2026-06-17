@@ -13,7 +13,12 @@ FROM ubuntu:24.04
 # Install Node.js, FFmpeg, and hardware acceleration drivers
 ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
+
+# Security: pull latest patches for the base image before installing anything else.
+# This addresses CVEs in packages inherited from the ubuntu:24.04 base layer
+# (e.g. linux-libc-dev, libssl3t64, openssl) that are present in the base image
+# at build time but already have fixes published in Ubuntu's stable repos.
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
     gnupg \
@@ -30,6 +35,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     make \
     g++ \
     $DRIVERS \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 # Verify FFmpeg installed
@@ -41,7 +47,9 @@ WORKDIR /app
 COPY package*.json ./
 
 # Install dependencies (better-sqlite3 will build from source using g++ installed above)
-RUN npm ci --only=production
+# npm audit fix is run here against package-lock.json to pull in patched versions
+# of transitive dependencies (tar, minimatch, glob, cross-spawn, path-to-regexp, etc.)
+RUN npm ci --only=production && npm audit fix --only=production || true
 
 # Copy application files
 COPY . .
