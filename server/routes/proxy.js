@@ -654,9 +654,6 @@ router.get('/stream', async (req, res) => {
             const contentRange = response.headers.get('content-range');
             const acceptRanges = response.headers.get('accept-ranges');
 
-            if (contentLength) {
-                res.set('Content-Length', contentLength);
-            }
             if (contentRange) {
                 res.set('Content-Range', contentRange);
             }
@@ -687,7 +684,9 @@ router.get('/stream', async (req, res) => {
             const contentLooksLikeHls = textPrefix === '#EXTM3U';
 
             if (contentLooksLikeHls) {
-                // HLS Manifest: We must read the WHOLE manifest to rewrite it
+                // HLS Manifest: this is a small text file (a playlist of segment URLs),
+                // never an infinite live stream, so it's safe and necessary to buffer
+                // it fully in order to rewrite the segment URLs to go through our proxy.
                 const chunks = [firstChunk];
 
                 // Consume the rest of the stream
@@ -740,23 +739,42 @@ router.get('/stream', async (req, res) => {
                 return res.send(manifest);
             }
 
-            // Binary content (Video Segment or Key): Collect and send
-            console.log(`[Proxy] Serving binary content (${contentType})`);
+            // Binary content (video segment, key, or a direct/continuous stream like
+            // MP4/TS live channels). This can be a never-ending stream, so we must
+            // pipe it through progressively instead of buffering it fully in memory -
+            // buffering would never resolve for a live stream and the client would
+            // hang waiting for the first byte forever.
+            console.log(`[Proxy] Streaming binary content (${contentType})`);
             res.set('Content-Type', contentType || 'application/octet-stream');
 
-            // For small files (like encryption keys), collect all data and send at once
-            // This ensures proper Content-Length and response completion
-            const chunks = [firstChunk];
-            let result = await iterator.next();
-            while (!result.done) {
-                chunks.push(Buffer.from(result.value));
-                result = await iterator.next();
+            // We only know Content-Length is safe to forward if the upstream actually
+            // sent one (true for finite resources like segments/keys; live streams
+            // typically omit it, in which case Express will use chunked encoding).
+            if (contentLength) {
+                res.set('Content-Length', contentLength);
             }
-            const fullContent = Buffer.concat(chunks);
 
-            // Set Content-Length for proper client handling
-            res.set('Content-Length', fullContent.length);
-            res.send(fullContent);
+            // Write the first chunk we already consumed while peeking for the HLS check
+            res.write(firstChunk);
+
+            // Pipe the remainder of the upstream body directly to the client as it
+            // arrives, instead of waiting for the stream to end.
+            try {
+                for await (const chunk of { [Symbol.asyncIterator]: () => iterator }) {
+                    // Stop early if the client disconnected (e.g. user changed channel)
+                    if (res.writableEnded || res.destroyed) {
+                        break;
+                    }
+                    res.write(Buffer.from(chunk));
+                }
+            } catch (streamErr) {
+                console.error('[Proxy] Error while streaming binary content:', streamErr.message);
+            } finally {
+                if (!res.writableEnded) {
+                    res.end();
+                }
+            }
+
             return; // Success - exit the retry loop
 
         } catch (err) {
